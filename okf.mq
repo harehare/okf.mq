@@ -8,14 +8,10 @@
 
 import "yaml" |
 
-# === Internal helpers ===
-
 def _okf_parse_link_str(s):
   let close = index(s, "](")
   | {text: slice(s, 1, close), url: slice(s, close + 2, len(s) - 1)}
 end
-
-# === Concept documents ===
 
 # Splits a Markdown string into its YAML frontmatter (dict) and body (string).
 # Documents without a leading `---` frontmatter block get an empty frontmatter dict.
@@ -58,15 +54,24 @@ def okf_type(doc):
 end
 
 # Validates a single concept document against the OKF conformance rules.
-# Returns an array of error strings; an empty array means conformant.
+# Returns an array of `{rule, field, message}` dicts, one per violation
+# found — `rule` is a stable machine-readable code, `field` names the
+# offending frontmatter key (or `None`), and `message` is human-readable.
+# An empty array means conformant.
 def okf_validate(doc):
   let fm = doc["frontmatter"]
   | if (!is_dict(fm)):
-      ["frontmatter must be a YAML mapping"]
-    elif (is_none(get_or(fm, "type", None)) || trim(to_string(get_or(fm, "type", ""))) == ""):
-      ["frontmatter must have a non-empty 'type' field"]
+      [{rule: "invalid_frontmatter", field: None, message: "frontmatter must be a YAML mapping"}]
     else:
-      []
+      do
+        let type_value = get_or(fm, "type", None)
+        | if (is_none(type_value)):
+            [{rule: "missing_required_field", field: "type", message: "frontmatter must have a 'type' field, but it is missing"}]
+          elif (trim(to_string(type_value)) == ""):
+            [{rule: "empty_required_field", field: "type", message: "frontmatter's 'type' field is present but empty or blank"}]
+          else:
+            []
+      end
 end
 
 # Returns true if a concept document satisfies `okf_validate`.
@@ -74,7 +79,21 @@ def okf_is_conformant(doc):
   is_empty(okf_validate(doc))
 end
 
-# === Reserved filenames ===
+# Formats one structured validation error (from `okf_validate` /
+# `okf_validate_bundle`) as a single human-readable string, e.g.
+# `"/tables/orders.md: frontmatter must have a 'type' field, but it is missing [field: type]"`.
+def okf_format_validation_error(error):
+  let location = get_or(error, "file", None)
+  | let field = get_or(error, "field", None)
+  | let prefix = if (is_none(location)): "" else: location + ": "
+  | let suffix = if (is_none(field)): "" else: " [field: " + field + "]"
+  | prefix + error["message"] + suffix
+end
+
+# Formats an array of structured validation errors as human-readable strings.
+def okf_format_validation_errors(errors):
+  map(errors, okf_format_validation_error)
+end
 
 def okf_reserved_filenames():
   ["index.md", "log.md"]
@@ -85,8 +104,6 @@ end
 def okf_is_reserved_filename(path):
   in(okf_reserved_filenames(), basename(path))
 end
-
-# === Cross-links ===
 
 # Classifies a link target as "external" (has a URL scheme), "absolute"
 # (bundle-relative, starts with `/`), or "relative" (e.g. `./other.md`).
@@ -115,8 +132,6 @@ def okf_check_broken_links(body, known_paths):
     link["kind"] != "external" && !in(known_paths, link["url"])
   end)
 end
-
-# === Citations ===
 
 # Formats a single citation list entry.
 def okf_citation_entry(number, text, url):
@@ -152,8 +167,6 @@ def okf_add_citation(body, text, url):
     else:
       rtrim(body_str) + "\n\n# Citations\n\n" + entry
 end
-
-# === Log files (log.md) ===
 
 # Formats a single log entry, e.g. `okf_log_entry("Update", "Renamed column x.")`.
 def okf_log_entry(kind, text):
@@ -219,8 +232,6 @@ def okf_parse_log(input):
   end
 end
 
-# === Index files (index.md) ===
-
 # Formats a single `index.md` list entry from `{path, title?, description?}`.
 def okf_index_entry(entry):
   let title = get_or(entry, "title", entry["path"])
@@ -261,8 +272,6 @@ def okf_parse_index(input):
   filter(map(split(to_string(input), "\n"), _okf_parse_index_line), fn(e): !is_none(e);)
 end
 
-# === Loading files from disk ===
-#
 # mq has no built-in directory walk, so `okf_discover_bundle` finds a
 # bundle's files by following its own `index.md` (and any nested index.md
 # files it links to) via `read_file` alone.
@@ -315,19 +324,92 @@ def okf_discover_bundle(root, index_path = "/index.md"):
   _okf_discover_paths(root, index_path)
 end
 
-# === Bundle-level validation ===
-
-def _okf_validate_file(file):
-  if (okf_is_reserved_filename(file["name"])):
-    []
-  else:
-    map(okf_validate(okf_parse(file["content"])), fn(e): file["name"] + ": " + e;)
+# `index.md` may appear at any depth and must carry no frontmatter, except
+# the bundle-root `index.md`, which may carry exactly `okf_version` (§11).
+def _okf_is_root_index_path(name):
+  is_regex_match(name, "^/?index\\.md$")
 end
 
-# Validates every non-reserved Markdown file in a bundle. `files` is an array
-# of `{name, content}`. Returns an array of "<name>: <error>" strings.
+def _okf_validate_index_structure(file):
+  let fm_keys = keys(okf_parse(file["content"])["frontmatter"])
+  | if (is_empty(fm_keys)):
+      []
+    elif (_okf_is_root_index_path(file["name"]) && fm_keys == ["okf_version"]):
+      []
+    elif (_okf_is_root_index_path(file["name"])):
+      [{rule: "frontmatter_not_allowed", field: None, message: "the bundle-root index.md may only carry an 'okf_version' field"}]
+    else:
+      [{rule: "frontmatter_not_allowed", field: None, message: "index.md must not contain frontmatter"}]
+end
+
+# `log.md` must carry no frontmatter, date headings must use ISO 8601
+# `YYYY-MM-DD`, and sections must be ordered newest first (§7).
+def _okf_validate_log_structure(file):
+  let doc = okf_parse(file["content"])
+  | let fm_errors = if (is_empty(keys(doc["frontmatter"]))):
+      []
+    else:
+      [{rule: "frontmatter_not_allowed", field: None, message: "log.md must not contain frontmatter"}]
+  | let heading_lines = filter(map(split(file["content"], "\n"), trim), fn(l): starts_with(l, "##");)
+  | let date_errors = flat_map(heading_lines, fn(l):
+      if (is_regex_match(l, "^## [0-9]{4}-[0-9]{2}-[0-9]{2}$")): [] else: [{rule: "invalid_date_heading", field: "date", message: "log.md date headings must use ISO 8601 'YYYY-MM-DD' form, found '" + l + "'"}];
+    )
+  | let sections = okf_parse_log(file["content"])
+  | let actual_dates = map(sections, fn(s): s["date"];)
+  | let newest_first_dates = map(reverse(sort_by(sections, fn(s): s["date"];)), fn(s): s["date"];)
+  | let order_errors = if (actual_dates == newest_first_dates):
+      []
+    else:
+      [{rule: "log_not_newest_first", field: "date", message: "log.md sections must be ordered newest first"}]
+  | fm_errors + date_errors + order_errors
+end
+
+def _okf_validate_file(file):
+  let name = file["name"]
+  | let errors = if (!okf_is_reserved_filename(name)):
+      okf_validate(okf_parse(file["content"]))
+    elif (basename(name) == "log.md"):
+      _okf_validate_log_structure(file)
+    else:
+      _okf_validate_index_structure(file)
+  | map(errors, fn(e): set(e, "file", name);)
+end
+
+# Validates every Markdown file in a bundle against the OKF conformance
+# rules: concept documents via `okf_validate`, and `index.md`/`log.md`
+# against their reserved-file structure rules (§6, §7). `files` is an array
+# of `{name, content}`. Returns an array of `{rule, field, message, file}`
+# dicts — pass it to `okf_format_validation_errors` for human-readable output.
 def okf_validate_bundle(files):
   flat_map(files, _okf_validate_file)
+end
+
+# Returns true if a bundle satisfies `okf_validate_bundle`.
+def okf_is_bundle_conformant(files):
+  is_empty(okf_validate_bundle(files))
+end
+
+def _okf_link_error(file_name, link):
+  {rule: "broken_link", field: "url", message: "link to '" + link["url"] + "' does not exist in the bundle", file: file_name, url: link["url"], text: link["text"]}
+end
+
+def _okf_check_bundle_links(files):
+  let known = map(files, fn(f): f["name"];)
+  | flat_map(files, fn(file):
+      map(okf_check_broken_links(okf_parse(file["content"])["body"], known), fn(link): _okf_link_error(file["name"], link);)
+    end)
+end
+
+# Discovers, loads, validates, and link-checks an entire bundle in one call:
+# runs `okf_validate_bundle` (frontmatter/type/reserved-file structure) and
+# `okf_check_broken_links` (internal cross-links) across every file
+# reachable from `root`'s `index.md`. Returns a single array of
+# `{rule, field, message, file}` dicts — broken-link errors also carry
+# `url`/`text`. Pass the result to `okf_format_validation_errors` for
+# plain-text output.
+def okf_check_bundle(root, index_path = "/index.md"):
+  let files = okf_load_bundle(okf_discover_bundle(root, index_path), root)
+  | okf_validate_bundle(files) + _okf_check_bundle_links(files)
 end
 
 # Summarizes a bundle's concept documents as `{path, type, title, description}`

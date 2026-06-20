@@ -2,15 +2,11 @@ include "test"
 | include "okf"
 |
 
-# === Test inputs ===
-
 let concept_doc = "---\ntype: BigQuery Table\ntitle: Customers\ndescription: Customer records table.\nresource: bigquery://project/dataset/customers\ntags:\n  - pii\n  - core\n---\n\n# Schema\n\nSome content here.\n"
 | let no_frontmatter_doc = "# Just a heading\n\nNo frontmatter here.\n"
 | let citations_body = "# Citations\n\n[1] [Source title](https://example.com/a)\n[2] [Internal reference](path/to/document.md)\n"
 | let log_input = "## 2026-06-15\n\n**Update**: Renamed column x.\n\n**Deprecation**: Old field removed.\n\n## 2026-06-01\n\n**Creation**: Added doc.\n"
 | let index_input = "- [Customers](/tables/customers.md) — Customer records.\n- [/tables/orders.md](/tables/orders.md) — Order records.\n" |
-
-# === okf_parse / okf_stringify ===
 
 def test_parse_frontmatter_and_body():
   let result = okf_parse(concept_doc)
@@ -43,8 +39,6 @@ def test_stringify_no_frontmatter():
   | assert_eq(result, "plain body")
 end
 
-# === okf_new / okf_type ===
-
 def test_new_merges_type():
   let doc = okf_new("Playbook", {title: "Deploy"}, "# Steps")
   | assert_eq(doc["frontmatter"]["type"], "Playbook")
@@ -65,8 +59,6 @@ def test_type_accessor_missing():
   assert_true(is_none(okf_type({frontmatter: {}, body: ""})))
 end
 
-# === okf_validate / okf_is_conformant ===
-
 def test_validate_conformant_doc():
   assert_eq(okf_validate(okf_parse(concept_doc)), [])
 end
@@ -74,11 +66,31 @@ end
 def test_validate_missing_type():
   let errors = okf_validate({frontmatter: {title: "x"}, body: ""})
   | assert_eq(len(errors), 1)
+  | assert_eq(errors[0]["rule"], "missing_required_field")
+  | assert_eq(errors[0]["field"], "type")
 end
 
 def test_validate_empty_type():
   let errors = okf_validate({frontmatter: {type: ""}, body: ""})
   | assert_eq(len(errors), 1)
+  | assert_eq(errors[0]["rule"], "empty_required_field")
+  | assert_eq(errors[0]["field"], "type")
+end
+
+def test_validate_frontmatter_not_mapping():
+  let errors = okf_validate({frontmatter: "oops", body: ""})
+  | assert_eq(len(errors), 1)
+  | assert_eq(errors[0]["rule"], "invalid_frontmatter")
+end
+
+def test_format_validation_error_includes_file_and_field():
+  let formatted = okf_format_validation_error({rule: "missing_required_field", field: "type", message: "frontmatter must have a 'type' field, but it is missing", file: "/tables/orders.md"})
+  | assert_eq(formatted, "/tables/orders.md: frontmatter must have a 'type' field, but it is missing [field: type]")
+end
+
+def test_format_validation_error_without_file_or_field():
+  let formatted = okf_format_validation_error({rule: "invalid_frontmatter", field: None, message: "frontmatter must be a YAML mapping"})
+  | assert_eq(formatted, "frontmatter must be a YAML mapping")
 end
 
 def test_is_conformant_true():
@@ -88,8 +100,6 @@ end
 def test_is_conformant_false():
   assert_true(!okf_is_conformant({frontmatter: {}, body: ""}))
 end
-
-# === reserved filenames ===
 
 def test_reserved_filenames_list():
   assert_eq(okf_reserved_filenames(), ["index.md", "log.md"])
@@ -106,8 +116,6 @@ end
 def test_is_reserved_filename_concept():
   assert_true(!okf_is_reserved_filename("/tables/customers.md"))
 end
-
-# === links ===
 
 def test_link_kind_external():
   assert_eq(okf_link_kind("https://example.com"), "external")
@@ -149,8 +157,6 @@ def test_check_broken_links_ignores_external():
   | assert_eq(broken, [])
 end
 
-# === citations ===
-
 def test_citation_entry_format():
   assert_eq(okf_citation_entry(1, "Title", "https://example.com"), "[1] [Title](https://example.com)")
 end
@@ -180,8 +186,6 @@ def test_add_citation_appends_and_renumbers():
   | assert_true(contains(result, "[3] [Third](https://example.com/c)"))
   | assert_eq(len(okf_extract_citations(result)), 3)
 end
-
-# === log.md ===
 
 def test_log_entry_format():
   assert_eq(okf_log_entry("Update", "Renamed column x."), "**Update**: Renamed column x.")
@@ -220,8 +224,6 @@ def test_build_then_parse_log_round_trip():
   | assert_eq(rebuilt, original)
 end
 
-# === index.md ===
-
 def test_index_entry_with_title_and_description():
   let entry = okf_index_entry({path: "/tables/customers.md", title: "Customers", description: "Customer records."})
   | assert_eq(entry, "- [Customers](/tables/customers.md) — Customer records.")
@@ -252,8 +254,6 @@ def test_parse_index():
   | assert_eq(entries[1]["path"], "/tables/orders.md")
 end
 
-# === bundle-level validation ===
-
 def test_validate_bundle_skips_reserved_files():
   let files = [{name: "index.md", content: "- [a](a.md)"}]
   | assert_eq(okf_validate_bundle(files), [])
@@ -263,7 +263,8 @@ def test_validate_bundle_reports_errors_with_filename():
   let files = [{name: "/tables/orders.md", content: "---\ntitle: Orders\n---\n\nBody.\n"}]
   | let errors = okf_validate_bundle(files)
   | assert_eq(len(errors), 1)
-  | assert_true(starts_with(errors[0], "/tables/orders.md:"))
+  | assert_eq(errors[0]["file"], "/tables/orders.md")
+  | assert_eq(errors[0]["rule"], "missing_required_field")
 end
 
 def test_validate_bundle_all_conformant():
@@ -271,9 +272,62 @@ def test_validate_bundle_all_conformant():
   | assert_eq(okf_validate_bundle(files), [])
 end
 
-# === summarize ===
+def test_validate_bundle_root_index_with_okf_version_is_valid():
+  let files = [{name: "/index.md", content: "---\nokf_version: \"0.1\"\n---\n\n- [a](/a.md)"}]
+  | assert_eq(okf_validate_bundle(files), [])
+end
 
-# === loading files from disk ===
+def test_validate_bundle_nested_index_with_frontmatter_is_invalid():
+  let files = [{name: "/tables/index.md", content: "---\nokf_version: \"0.1\"\n---\n\n- [a](/a.md)"}]
+  | let errors = okf_validate_bundle(files)
+  | assert_eq(len(errors), 1)
+  | assert_eq(errors[0]["rule"], "frontmatter_not_allowed")
+  | assert_eq(errors[0]["file"], "/tables/index.md")
+end
+
+def test_validate_bundle_root_index_with_extra_frontmatter_field_is_invalid():
+  let files = [{name: "/index.md", content: "---\nokf_version: \"0.1\"\ntitle: Root\n---\n\n- [a](/a.md)"}]
+  | let errors = okf_validate_bundle(files)
+  | assert_eq(len(errors), 1)
+  | assert_eq(errors[0]["rule"], "frontmatter_not_allowed")
+end
+
+def test_validate_bundle_log_with_frontmatter_is_invalid():
+  let files = [{name: "/log.md", content: "---\ntitle: Log\n---\n\n## 2026-06-01\n\n**Creation**: Added doc."}]
+  | let errors = okf_validate_bundle(files)
+  | assert_eq(len(errors), 1)
+  | assert_eq(errors[0]["rule"], "frontmatter_not_allowed")
+  | assert_eq(errors[0]["file"], "/log.md")
+end
+
+def test_validate_bundle_log_with_invalid_date_heading_is_invalid():
+  let files = [{name: "/log.md", content: "## June 2026\n\n**Creation**: Added doc."}]
+  | let errors = okf_validate_bundle(files)
+  | assert_eq(len(errors), 1)
+  | assert_eq(errors[0]["rule"], "invalid_date_heading")
+end
+
+def test_validate_bundle_log_not_newest_first_is_invalid():
+  let files = [{name: "/log.md", content: "## 2026-06-01\n\n**Creation**: Added doc.\n\n## 2026-06-15\n\n**Update**: Renamed column x."}]
+  | let errors = okf_validate_bundle(files)
+  | assert_eq(len(errors), 1)
+  | assert_eq(errors[0]["rule"], "log_not_newest_first")
+end
+
+def test_validate_bundle_log_valid():
+  let files = [{name: "/log.md", content: log_input}]
+  | assert_eq(okf_validate_bundle(files), [])
+end
+
+def test_is_bundle_conformant_true():
+  let files = [{name: "/tables/customers.md", content: concept_doc}]
+  | assert_true(okf_is_bundle_conformant(files))
+end
+
+def test_is_bundle_conformant_false():
+  let files = [{name: "/tables/orders.md", content: "---\ntitle: Orders\n---\n\nBody.\n"}]
+  | assert_true(!okf_is_bundle_conformant(files))
+end
 
 def test_load_concept_reads_and_parses():
   let doc = okf_load_concept("testdata/customers.md")
@@ -312,7 +366,23 @@ def test_discover_bundle_paths_are_loadable_and_validate():
   | let bundle = okf_load_bundle(okf_discover_bundle(root), root)
   | let errors = okf_validate_bundle(bundle)
   | assert_eq(len(errors), 1)
-  | assert_true(starts_with(errors[0], "/tables/orders.md:"))
+  | assert_eq(errors[0]["file"], "/tables/orders.md")
+  | assert_eq(errors[0]["rule"], "missing_required_field")
+end
+
+def test_check_bundle_reports_validation_error():
+  let errors = okf_check_bundle("testdata/bundle")
+  | assert_eq(len(errors), 1)
+  | assert_eq(errors[0]["file"], "/tables/orders.md")
+  | assert_eq(errors[0]["rule"], "missing_required_field")
+end
+
+def test_check_bundle_reports_broken_link():
+  let errors = okf_check_bundle("testdata/bundle_with_broken_link")
+  | assert_eq(len(errors), 1)
+  | assert_eq(errors[0]["rule"], "broken_link")
+  | assert_eq(errors[0]["file"], "/widgets.md")
+  | assert_eq(errors[0]["url"], "/missing.md")
 end
 
 def test_discover_bundle_no_broken_links():
