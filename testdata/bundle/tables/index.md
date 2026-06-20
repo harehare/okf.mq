@@ -1,0 +1,2 @@
+- [Customers](/tables/customers.md) — Customer records table.
+- [Orders](/tables/orders.md) — Order records table.

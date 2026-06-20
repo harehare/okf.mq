@@ -1,0 +1,336 @@
+include "test"
+| include "okf"
+|
+
+# === Test inputs ===
+
+let concept_doc = "---\ntype: BigQuery Table\ntitle: Customers\ndescription: Customer records table.\nresource: bigquery://project/dataset/customers\ntags:\n  - pii\n  - core\n---\n\n# Schema\n\nSome content here.\n"
+| let no_frontmatter_doc = "# Just a heading\n\nNo frontmatter here.\n"
+| let citations_body = "# Citations\n\n[1] [Source title](https://example.com/a)\n[2] [Internal reference](path/to/document.md)\n"
+| let log_input = "## 2026-06-15\n\n**Update**: Renamed column x.\n\n**Deprecation**: Old field removed.\n\n## 2026-06-01\n\n**Creation**: Added doc.\n"
+| let index_input = "- [Customers](/tables/customers.md) — Customer records.\n- [/tables/orders.md](/tables/orders.md) — Order records.\n" |
+
+# === okf_parse / okf_stringify ===
+
+def test_parse_frontmatter_and_body():
+  let result = okf_parse(concept_doc)
+  | assert_eq(result["frontmatter"]["type"], "BigQuery Table")
+  | assert_eq(result["frontmatter"]["title"], "Customers")
+  | assert_eq(result["frontmatter"]["tags"], ["pii", "core"])
+  | assert_eq(result["body"], "# Schema\n\nSome content here.")
+end
+
+def test_parse_without_frontmatter():
+  let result = okf_parse(no_frontmatter_doc)
+  | assert_eq(len(keys(result["frontmatter"])), 0)
+  | assert_eq(result["body"], no_frontmatter_doc)
+end
+
+def test_parse_empty_string():
+  let result = okf_parse("")
+  | assert_eq(len(keys(result["frontmatter"])), 0)
+end
+
+def test_stringify_roundtrip_type():
+  let doc = okf_parse(concept_doc)
+  | let restringified = okf_stringify(doc)
+  | let reparsed = okf_parse(restringified)
+  | assert_eq(reparsed["frontmatter"]["type"], "BigQuery Table")
+end
+
+def test_stringify_no_frontmatter():
+  let result = okf_stringify({frontmatter: {}, body: "plain body"})
+  | assert_eq(result, "plain body")
+end
+
+# === okf_new / okf_type ===
+
+def test_new_merges_type():
+  let doc = okf_new("Playbook", {title: "Deploy"}, "# Steps")
+  | assert_eq(doc["frontmatter"]["type"], "Playbook")
+  | assert_eq(doc["frontmatter"]["title"], "Deploy")
+  | assert_eq(doc["body"], "# Steps")
+end
+
+def test_new_type_overrides_fields_type():
+  let doc = okf_new("Playbook", {type: "Wrong"}, "body")
+  | assert_eq(doc["frontmatter"]["type"], "Playbook")
+end
+
+def test_type_accessor():
+  assert_eq(okf_type(okf_parse(concept_doc)), "BigQuery Table")
+end
+
+def test_type_accessor_missing():
+  assert_true(is_none(okf_type({frontmatter: {}, body: ""})))
+end
+
+# === okf_validate / okf_is_conformant ===
+
+def test_validate_conformant_doc():
+  assert_eq(okf_validate(okf_parse(concept_doc)), [])
+end
+
+def test_validate_missing_type():
+  let errors = okf_validate({frontmatter: {title: "x"}, body: ""})
+  | assert_eq(len(errors), 1)
+end
+
+def test_validate_empty_type():
+  let errors = okf_validate({frontmatter: {type: ""}, body: ""})
+  | assert_eq(len(errors), 1)
+end
+
+def test_is_conformant_true():
+  assert_true(okf_is_conformant(okf_parse(concept_doc)))
+end
+
+def test_is_conformant_false():
+  assert_true(!okf_is_conformant({frontmatter: {}, body: ""}))
+end
+
+# === reserved filenames ===
+
+def test_reserved_filenames_list():
+  assert_eq(okf_reserved_filenames(), ["index.md", "log.md"])
+end
+
+def test_is_reserved_filename_index():
+  assert_true(okf_is_reserved_filename("index.md"))
+end
+
+def test_is_reserved_filename_log_nested_path():
+  assert_true(okf_is_reserved_filename("/bundle/sub/log.md"))
+end
+
+def test_is_reserved_filename_concept():
+  assert_true(!okf_is_reserved_filename("/tables/customers.md"))
+end
+
+# === links ===
+
+def test_link_kind_external():
+  assert_eq(okf_link_kind("https://example.com"), "external")
+end
+
+def test_link_kind_absolute():
+  assert_eq(okf_link_kind("/tables/customers.md"), "absolute")
+end
+
+def test_link_kind_relative():
+  assert_eq(okf_link_kind("./other.md"), "relative")
+end
+
+def test_extract_links():
+  let links = okf_extract_links("See [Customers](/tables/customers.md) and [Google](https://google.com) and [rel](./other.md).")
+  | assert_eq(len(links), 3)
+  | assert_eq(links[0]["text"], "Customers")
+  | assert_eq(links[0]["url"], "/tables/customers.md")
+  | assert_eq(links[0]["kind"], "absolute")
+  | assert_eq(links[1]["kind"], "external")
+  | assert_eq(links[2]["kind"], "relative")
+end
+
+def test_extract_links_none():
+  assert_eq(okf_extract_links("No links here."), [])
+end
+
+def test_check_broken_links():
+  let broken = okf_check_broken_links(
+    "See [Customers](/tables/customers.md) and [Missing](/tables/missing.md).",
+    ["/tables/customers.md"]
+  )
+  | assert_eq(len(broken), 1)
+  | assert_eq(broken[0]["url"], "/tables/missing.md")
+end
+
+def test_check_broken_links_ignores_external():
+  let broken = okf_check_broken_links("See [Google](https://google.com).", [])
+  | assert_eq(broken, [])
+end
+
+# === citations ===
+
+def test_citation_entry_format():
+  assert_eq(okf_citation_entry(1, "Title", "https://example.com"), "[1] [Title](https://example.com)")
+end
+
+def test_extract_citations():
+  let citations = okf_extract_citations(citations_body)
+  | assert_eq(len(citations), 2)
+  | assert_eq(citations[0]["number"], 1)
+  | assert_eq(citations[0]["text"], "Source title")
+  | assert_eq(citations[0]["url"], "https://example.com/a")
+  | assert_eq(citations[1]["number"], 2)
+  | assert_eq(citations[1]["url"], "path/to/document.md")
+end
+
+def test_extract_citations_none():
+  assert_eq(okf_extract_citations("# Citations\n\nNo entries yet.\n"), [])
+end
+
+def test_add_citation_creates_section():
+  let result = okf_add_citation("# Schema\n\nBody text.", "New Source", "https://example.com/new")
+  | assert_true(contains(result, "# Citations"))
+  | assert_true(contains(result, "[1] [New Source](https://example.com/new)"))
+end
+
+def test_add_citation_appends_and_renumbers():
+  let result = okf_add_citation(citations_body, "Third", "https://example.com/c")
+  | assert_true(contains(result, "[3] [Third](https://example.com/c)"))
+  | assert_eq(len(okf_extract_citations(result)), 3)
+end
+
+# === log.md ===
+
+def test_log_entry_format():
+  assert_eq(okf_log_entry("Update", "Renamed column x."), "**Update**: Renamed column x.")
+end
+
+def test_log_section_format():
+  let section = okf_log_section({date: "2026-06-01", entries: [{kind: "Creation", text: "Added doc."}]})
+  | assert_true(contains(section, "## 2026-06-01"))
+  | assert_true(contains(section, "**Creation**: Added doc."))
+end
+
+def test_build_log_orders_newest_first():
+  let result = okf_build_log([
+    {date: "2026-06-01", entries: [{kind: "Creation", text: "Added doc."}]},
+    {date: "2026-06-15", entries: [{kind: "Update", text: "Renamed column x."}]}
+  ])
+  | let first_idx = index(result, "## 2026-06-15")
+  | let second_idx = index(result, "## 2026-06-01")
+  | assert_true(first_idx < second_idx)
+end
+
+def test_parse_log_round_trip():
+  let sections = okf_parse_log(log_input)
+  | assert_eq(len(sections), 2)
+  | assert_eq(sections[0]["date"], "2026-06-15")
+  | assert_eq(len(sections[0]["entries"]), 2)
+  | assert_eq(sections[0]["entries"][0]["kind"], "Update")
+  | assert_eq(sections[0]["entries"][0]["text"], "Renamed column x.")
+  | assert_eq(sections[1]["date"], "2026-06-01")
+  | assert_eq(sections[1]["entries"][0]["kind"], "Creation")
+end
+
+def test_build_then_parse_log_round_trip():
+  let original = [{date: "2026-06-01", entries: [{kind: "Update", text: "x changed."}]}]
+  | let rebuilt = okf_parse_log(okf_build_log(original))
+  | assert_eq(rebuilt, original)
+end
+
+# === index.md ===
+
+def test_index_entry_with_title_and_description():
+  let entry = okf_index_entry({path: "/tables/customers.md", title: "Customers", description: "Customer records."})
+  | assert_eq(entry, "- [Customers](/tables/customers.md) — Customer records.")
+end
+
+def test_index_entry_without_title_or_description():
+  let entry = okf_index_entry({path: "/tables/orders.md"})
+  | assert_eq(entry, "- [/tables/orders.md](/tables/orders.md)")
+end
+
+def test_build_index_without_version():
+  let result = okf_build_index([{path: "/a.md", title: "A"}])
+  | assert_true(!contains(result, "okf_version"))
+  | assert_true(contains(result, "- [A](/a.md)"))
+end
+
+def test_build_index_with_version():
+  let result = okf_build_index([{path: "/a.md", title: "A"}], "0.1")
+  | assert_true(contains(result, "okf_version: 0.1"))
+end
+
+def test_parse_index():
+  let entries = okf_parse_index(index_input)
+  | assert_eq(len(entries), 2)
+  | assert_eq(entries[0]["path"], "/tables/customers.md")
+  | assert_eq(entries[0]["title"], "Customers")
+  | assert_eq(entries[0]["description"], "Customer records.")
+  | assert_eq(entries[1]["path"], "/tables/orders.md")
+end
+
+# === bundle-level validation ===
+
+def test_validate_bundle_skips_reserved_files():
+  let files = [{name: "index.md", content: "- [a](a.md)"}]
+  | assert_eq(okf_validate_bundle(files), [])
+end
+
+def test_validate_bundle_reports_errors_with_filename():
+  let files = [{name: "/tables/orders.md", content: "---\ntitle: Orders\n---\n\nBody.\n"}]
+  | let errors = okf_validate_bundle(files)
+  | assert_eq(len(errors), 1)
+  | assert_true(starts_with(errors[0], "/tables/orders.md:"))
+end
+
+def test_validate_bundle_all_conformant():
+  let files = [{name: "/tables/customers.md", content: concept_doc}]
+  | assert_eq(okf_validate_bundle(files), [])
+end
+
+# === summarize ===
+
+# === loading files from disk ===
+
+def test_load_concept_reads_and_parses():
+  let doc = okf_load_concept("testdata/customers.md")
+  | assert_eq(doc["frontmatter"]["type"], "BigQuery Table")
+  | assert_eq(doc["frontmatter"]["title"], "Customers")
+  | assert_true(contains(doc["body"], "[Orders](/tables/orders.md)"))
+end
+
+def test_load_bundle_without_root_keeps_paths():
+  let bundle = okf_load_bundle(["testdata/customers.md"])
+  | assert_eq(len(bundle), 1)
+  | assert_eq(bundle[0]["name"], "testdata/customers.md")
+  | assert_true(contains(bundle[0]["content"], "type: BigQuery Table"))
+end
+
+def test_load_bundle_with_root_rewrites_to_bundle_relative():
+  let bundle = okf_load_bundle(["testdata/customers.md"], "testdata")
+  | assert_eq(bundle[0]["name"], "/customers.md")
+end
+
+def test_load_bundle_then_validate():
+  let bundle = okf_load_bundle(["testdata/customers.md"], "testdata")
+  | assert_eq(okf_validate_bundle(bundle), [])
+end
+
+def test_discover_bundle_follows_nested_index():
+  let paths = okf_discover_bundle("testdata/bundle")
+  | assert_eq(len(paths), 3)
+  | assert_true(in(paths, "testdata/bundle/tables/customers.md"))
+  | assert_true(in(paths, "testdata/bundle/tables/orders.md"))
+  | assert_true(in(paths, "testdata/bundle/playbooks/onboarding.md"))
+end
+
+def test_discover_bundle_paths_are_loadable_and_validate():
+  let root = "testdata/bundle"
+  | let bundle = okf_load_bundle(okf_discover_bundle(root), root)
+  | let errors = okf_validate_bundle(bundle)
+  | assert_eq(len(errors), 1)
+  | assert_true(starts_with(errors[0], "/tables/orders.md:"))
+end
+
+def test_discover_bundle_no_broken_links():
+  let root = "testdata/bundle"
+  | let bundle = okf_load_bundle(okf_discover_bundle(root), root)
+  | let known = map(bundle, fn(f): f["name"];)
+  | let broken = flat_map(bundle, fn(f): okf_check_broken_links(okf_parse(f["content"])["body"], known);)
+  | assert_eq(broken, [])
+end
+
+def test_summarize_excludes_reserved_files():
+  let files = [
+    {name: "/tables/customers.md", content: concept_doc},
+    {name: "index.md", content: "- [a](a.md)"}
+  ]
+  | let summary = okf_summarize(files)
+  | assert_eq(len(summary), 1)
+  | assert_eq(summary[0]["path"], "/tables/customers.md")
+  | assert_eq(summary[0]["type"], "BigQuery Table")
+  | assert_eq(summary[0]["title"], "Customers")
+end

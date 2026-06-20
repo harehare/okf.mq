@@ -1,0 +1,345 @@
+# OKF (Open Knowledge Format) Implementation in mq
+# Spec: https://github.com/GoogleCloudPlatform/knowledge-catalog (okf/SPEC.md)
+#
+# OKF represents knowledge as a directory ("bundle") of Markdown files with
+# YAML frontmatter. This module parses, builds, and validates OKF bundles:
+# concept documents, the `index.md` and `log.md` reserved files, citations,
+# and cross-links between documents.
+
+import "yaml" |
+
+# === Internal helpers ===
+
+def _okf_parse_link_str(s):
+  let close = index(s, "](")
+  | {text: slice(s, 1, close), url: slice(s, close + 2, len(s) - 1)}
+end
+
+# === Concept documents ===
+
+# Splits a Markdown string into its YAML frontmatter (dict) and body (string).
+# Documents without a leading `---` frontmatter block get an empty frontmatter dict.
+def okf_parse(input):
+  let lines = split(to_string(input), "\n")
+  | if (is_empty(lines) || lines[0] != "---"):
+      {frontmatter: {}, body: to_string(input)}
+    else:
+      do
+        let close = find_index(skip(lines, 1), fn(line): line == "---";)
+        | if (close == -1):
+            {frontmatter: {}, body: to_string(input)}
+          else:
+            do
+              let fm_text = join(slice(lines, 1, close + 1), "\n")
+              | let body = trim(join(slice(lines, close + 2, len(lines)), "\n"))
+              | {frontmatter: yaml::yaml_parse(fm_text), body: body}
+            end
+      end
+end
+
+# Renders a `{frontmatter, body}` doc back into a Markdown string.
+def okf_stringify(doc):
+  if (is_empty(keys(doc["frontmatter"]))):
+    doc["body"]
+  else:
+    yaml::to_frontmatter(doc["frontmatter"]) + "\n\n" + doc["body"]
+end
+
+# Builds a new concept document. `fields` holds the frontmatter
+# (title, description, resource, tags, timestamp, or any producer-defined key);
+# `type` is merged in and always wins.
+def okf_new(type, fields, body):
+  {frontmatter: set(fields, "type", type), body: body}
+end
+
+# Returns the `type` of a concept document, or None if it has no frontmatter.
+def okf_type(doc):
+  get_or(doc["frontmatter"], "type", None)
+end
+
+# Validates a single concept document against the OKF conformance rules.
+# Returns an array of error strings; an empty array means conformant.
+def okf_validate(doc):
+  let fm = doc["frontmatter"]
+  | if (!is_dict(fm)):
+      ["frontmatter must be a YAML mapping"]
+    elif (is_none(get_or(fm, "type", None)) || trim(to_string(get_or(fm, "type", ""))) == ""):
+      ["frontmatter must have a non-empty 'type' field"]
+    else:
+      []
+end
+
+# Returns true if a concept document satisfies `okf_validate`.
+def okf_is_conformant(doc):
+  is_empty(okf_validate(doc))
+end
+
+# === Reserved filenames ===
+
+def okf_reserved_filenames():
+  ["index.md", "log.md"]
+end
+
+# Returns true if `path`'s basename is a reserved bundle filename
+# (`index.md` or `log.md`), which cannot be used for concept documents.
+def okf_is_reserved_filename(path):
+  in(okf_reserved_filenames(), basename(path))
+end
+
+# === Cross-links ===
+
+# Classifies a link target as "external" (has a URL scheme), "absolute"
+# (bundle-relative, starts with `/`), or "relative" (e.g. `./other.md`).
+def okf_link_kind(url):
+  if (is_regex_match(url, "^[a-zA-Z][a-zA-Z0-9+.-]*://")):
+    "external"
+  elif (starts_with(url, "/")):
+    "absolute"
+  else:
+    "relative"
+end
+
+# Extracts every Markdown link (`[text](url)`) from `body` as
+# `{text, url, kind}` dicts.
+def okf_extract_links(body):
+  map(regex_match(to_string(body), "\\[[^\\]]*\\]\\([^)]*\\)"), fn(m):
+    let link = _okf_parse_link_str(m)
+    | set(link, "kind", okf_link_kind(link["url"]))
+  end)
+end
+
+# Returns the subset of `body`'s internal (non-external) links whose `url`
+# is not present in `known_paths` — i.e. links that are likely broken.
+def okf_check_broken_links(body, known_paths):
+  filter(okf_extract_links(body), fn(link):
+    link["kind"] != "external" && !in(known_paths, link["url"])
+  end)
+end
+
+# === Citations ===
+
+# Formats a single citation list entry.
+def okf_citation_entry(number, text, url):
+  "[" + to_string(number) + "] [" + text + "](" + url + ")"
+end
+
+def _okf_parse_citation_line(line):
+  let close = index(line, "]")
+  | let rest = trim(slice(line, close + 1, len(line)))
+  | let link = _okf_parse_link_str(rest)
+  | {number: to_number(slice(line, 1, close)), text: link["text"], url: link["url"]}
+end
+
+# Parses the numbered citation list under a `# Citations` heading into
+# `{number, text, url}` dicts. Internal references (`[2] [...](path/to.md)`)
+# parse the same as external sources.
+def okf_extract_citations(body):
+  map(
+    filter(split(to_string(body), "\n"), fn(line): is_regex_match(trim(line), "^\\[[0-9]+\\]");),
+    fn(line): _okf_parse_citation_line(trim(line));
+  )
+end
+
+# Appends a new, auto-numbered citation to `body`, creating the
+# `# Citations` section if it doesn't already exist.
+def okf_add_citation(body, text, url):
+  let body_str = to_string(body)
+  | let existing = okf_extract_citations(body_str)
+  | let next_number = fold(existing, 0, fn(acc, c): if (c["number"] > acc): c["number"] else: acc;) + 1
+  | let entry = okf_citation_entry(next_number, text, url)
+  | if (contains(body_str, "# Citations")):
+      rtrim(body_str) + "\n" + entry
+    else:
+      rtrim(body_str) + "\n\n# Citations\n\n" + entry
+end
+
+# === Log files (log.md) ===
+
+# Formats a single log entry, e.g. `okf_log_entry("Update", "Renamed column x.")`.
+def okf_log_entry(kind, text):
+  "**" + kind + "**: " + text
+end
+
+# Formats one date-grouped log section from `{date, entries: [{kind, text}]}`.
+def okf_log_section(section):
+  "## " + section["date"] + "\n\n" +
+    join(map(section["entries"], fn(e): okf_log_entry(e["kind"], e["text"]);), "\n\n")
+end
+
+# Renders `log.md` content from an array of `{date, entries}` sections,
+# sorted newest-first as required by the spec.
+def okf_build_log(sections):
+  join(map(reverse(sort_by(sections, fn(s): s["date"];)), okf_log_section), "\n\n")
+end
+
+def _okf_parse_log_entry_line(line):
+  let l = trim(line)
+  | if (!starts_with(l, "**")):
+      None
+    else:
+      do
+        let tail = slice(l, 2, len(l))
+        | let close = index(tail, "**")
+        | if (close == -1):
+            None
+          else:
+            do
+              let rest = trim(slice(tail, close + 2, len(tail)))
+              | let text = if (starts_with(rest, ":")): trim(slice(rest, 1, len(rest))) else: rest
+              | {kind: slice(tail, 0, close), text: text}
+            end
+      end
+end
+
+# Parses `log.md` content into an array of `{date, entries: [{kind, text}]}`,
+# in the order the sections appear in the input.
+def okf_parse_log(input):
+  do
+    var sections = []
+    | var current_date = ""
+    | var current_entries = []
+    | foreach (raw_line, split(to_string(input), "\n")):
+        do
+          let line = trim(raw_line)
+          | if (is_regex_match(line, "^## [0-9]{4}-[0-9]{2}-[0-9]{2}$")):
+              do
+                sections = if (current_date == ""): sections else: sections + [{date: current_date, entries: current_entries}]
+                | current_date = trim(slice(line, 2, len(line)))
+                | current_entries = []
+              end
+            else:
+              do
+                let parsed = _okf_parse_log_entry_line(line)
+                | if (is_none(parsed)): None else: current_entries = current_entries + [parsed]
+              end
+          | None
+        end
+      end
+    | if (current_date == ""): sections else: sections + [{date: current_date, entries: current_entries}]
+  end
+end
+
+# === Index files (index.md) ===
+
+# Formats a single `index.md` list entry from `{path, title?, description?}`.
+def okf_index_entry(entry):
+  let title = get_or(entry, "title", entry["path"])
+  | let description = get_or(entry, "description", "")
+  | "- [" + title + "](" + entry["path"] + ")" + (if (description == ""): "" else: " — " + description)
+end
+
+# Renders `index.md` content from an array of entries (see `okf_index_entry`).
+# Pass `version` to emit the `okf_version` frontmatter — only valid on the
+# bundle-root `index.md`.
+def okf_build_index(entries, version = ""):
+  let body = join(map(entries, okf_index_entry), "\n")
+  | if (version == ""): body else: yaml::to_frontmatter({okf_version: version}) + "\n\n" + body
+end
+
+def _okf_parse_index_line(line):
+  let l = trim(line)
+  | if (!starts_with(l, "-")):
+      None
+    else:
+      do
+        let matches = regex_match(l, "\\[[^\\]]*\\]\\([^)]*\\)")
+        | if (is_empty(matches)):
+            None
+          else:
+            do
+              let link = _okf_parse_link_str(matches[0])
+              | let after = trim(slice(l, index(l, matches[0]) + len(matches[0]), len(l)))
+              | let description = if (starts_with(after, "—")): trim(slice(after, 1, len(after))) else: after
+              | {path: link["url"], title: link["text"], description: description}
+            end
+      end
+end
+
+# Parses `index.md` content (as produced by `okf_build_index`/`okf_index_entry`)
+# into an array of `{path, title, description}` dicts.
+def okf_parse_index(input):
+  filter(map(split(to_string(input), "\n"), _okf_parse_index_line), fn(e): !is_none(e);)
+end
+
+# === Loading files from disk ===
+#
+# mq has no built-in directory walk, so `okf_discover_bundle` finds a
+# bundle's files by following its own `index.md` (and any nested index.md
+# files it links to) via `read_file` alone.
+
+# Reads and parses a single concept document from disk.
+def okf_load_concept(path):
+  okf_parse(read_file(path))
+end
+
+def _okf_bundle_relative_name(path, root):
+  if (root == ""):
+    path
+  else:
+    do
+      let rel = if (starts_with(path, root)): slice(path, len(root), len(path)) else: path
+      | if (starts_with(rel, "/")): rel else: "/" + rel
+    end
+end
+
+# Reads an array of file paths (e.g. from `okf_discover_bundle`) into the
+# `{name, content}` shape used by `okf_validate_bundle`, `okf_summarize`, and
+# `okf_check_broken_links`. Pass `root` (the bundle's top-level directory) to
+# rewrite `name` as a bundle-relative absolute path (e.g. `/tables/x.md`),
+# matching the convention used by `okf_link_kind`/internal links.
+def okf_load_bundle(paths, root = ""):
+  map(paths, fn(path): {name: _okf_bundle_relative_name(path, root), content: read_file(path)};)
+end
+
+def _okf_resolve_path(root, bundle_path):
+  let rel = if (starts_with(bundle_path, "/")): slice(bundle_path, 1, len(bundle_path)) else: bundle_path
+  | path_join(root, rel)
+end
+
+def _okf_discover_paths(root, index_bundle_path):
+  let entries = okf_parse_index(read_file(_okf_resolve_path(root, index_bundle_path)))
+  | flat_map(entries, fn(entry):
+    if (basename(entry["path"]) == "index.md"):
+      _okf_discover_paths(root, entry["path"])
+    else:
+      [_okf_resolve_path(root, entry["path"])]
+  end)
+end
+
+# Discovers every concept document's filesystem path reachable from a
+# bundle's `index.md` (default: `<root>/index.md`), following nested
+# `index.md` entries for progressive disclosure. Needs no directory
+# listing — only `read_file`, driven entirely by what the index says
+# exists. Returns filesystem paths ready for `okf_load_bundle(paths, root)`.
+def okf_discover_bundle(root, index_path = "/index.md"):
+  _okf_discover_paths(root, index_path)
+end
+
+# === Bundle-level validation ===
+
+def _okf_validate_file(file):
+  if (okf_is_reserved_filename(file["name"])):
+    []
+  else:
+    map(okf_validate(okf_parse(file["content"])), fn(e): file["name"] + ": " + e;)
+end
+
+# Validates every non-reserved Markdown file in a bundle. `files` is an array
+# of `{name, content}`. Returns an array of "<name>: <error>" strings.
+def okf_validate_bundle(files):
+  flat_map(files, _okf_validate_file)
+end
+
+# Summarizes a bundle's concept documents as `{path, type, title, description}`
+# dicts, e.g. for building an overview table with `yaml::yaml_to_markdown_table`.
+def okf_summarize(files):
+  map(filter(files, fn(f): !okf_is_reserved_filename(f["name"]);), fn(file):
+    let doc = okf_parse(file["content"])
+    | {
+      path: file["name"],
+      type: get_or(doc["frontmatter"], "type", ""),
+      title: get_or(doc["frontmatter"], "title", ""),
+      description: get_or(doc["frontmatter"], "description", "")
+    }
+  end)
+end
