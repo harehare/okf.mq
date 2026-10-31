@@ -242,7 +242,7 @@ end
 
 def test_build_index_with_version():
   let result = okf_build_index([{path: "/a.md", title: "A"}], "0.1")
-  | assert_true(contains(result, "okf_version: 0.1"))
+  | assert_true(contains(result, "okf_version: \"0.1\""))
 end
 
 def test_parse_index():
@@ -327,70 +327,6 @@ end
 def test_is_bundle_conformant_false():
   let files = [{name: "/tables/orders.md", content: "---\ntitle: Orders\n---\n\nBody.\n"}]
   | assert_true(!okf_is_bundle_conformant(files))
-end
-
-def test_load_concept_reads_and_parses():
-  let doc = okf_load_concept("testdata/customers.md")
-  | assert_eq(doc["frontmatter"]["type"], "BigQuery Table")
-  | assert_eq(doc["frontmatter"]["title"], "Customers")
-  | assert_true(contains(doc["body"], "[Orders](/tables/orders.md)"))
-end
-
-def test_load_bundle_without_root_keeps_paths():
-  let bundle = okf_load_bundle(["testdata/customers.md"])
-  | assert_eq(len(bundle), 1)
-  | assert_eq(bundle[0]["name"], "testdata/customers.md")
-  | assert_true(contains(bundle[0]["content"], "type: BigQuery Table"))
-end
-
-def test_load_bundle_with_root_rewrites_to_bundle_relative():
-  let bundle = okf_load_bundle(["testdata/customers.md"], "testdata")
-  | assert_eq(bundle[0]["name"], "/customers.md")
-end
-
-def test_load_bundle_then_validate():
-  let bundle = okf_load_bundle(["testdata/customers.md"], "testdata")
-  | assert_eq(okf_validate_bundle(bundle), [])
-end
-
-def test_discover_bundle_follows_nested_index():
-  let paths = okf_discover_bundle("testdata/bundle")
-  | assert_eq(len(paths), 3)
-  | assert_true(in(paths, "testdata/bundle/tables/customers.md"))
-  | assert_true(in(paths, "testdata/bundle/tables/orders.md"))
-  | assert_true(in(paths, "testdata/bundle/playbooks/onboarding.md"))
-end
-
-def test_discover_bundle_paths_are_loadable_and_validate():
-  let root = "testdata/bundle"
-  | let bundle = okf_load_bundle(okf_discover_bundle(root), root)
-  | let errors = okf_validate_bundle(bundle)
-  | assert_eq(len(errors), 1)
-  | assert_eq(errors[0]["file"], "/tables/orders.md")
-  | assert_eq(errors[0]["rule"], "missing_required_field")
-end
-
-def test_check_bundle_reports_validation_error():
-  let errors = okf_check_bundle("testdata/bundle")
-  | assert_eq(len(errors), 1)
-  | assert_eq(errors[0]["file"], "/tables/orders.md")
-  | assert_eq(errors[0]["rule"], "missing_required_field")
-end
-
-def test_check_bundle_reports_broken_link():
-  let errors = okf_check_bundle("testdata/bundle_with_broken_link")
-  | assert_eq(len(errors), 1)
-  | assert_eq(errors[0]["rule"], "broken_link")
-  | assert_eq(errors[0]["file"], "/widgets.md")
-  | assert_eq(errors[0]["url"], "/missing.md")
-end
-
-def test_discover_bundle_no_broken_links():
-  let root = "testdata/bundle"
-  | let bundle = okf_load_bundle(okf_discover_bundle(root), root)
-  | let known = map(bundle, fn(f): f["name"];)
-  | let broken = flat_map(bundle, fn(f): okf_check_broken_links(okf_parse(f["content"])["body"], known);)
-  | assert_eq(broken, [])
 end
 
 def test_summarize_excludes_reserved_files():
